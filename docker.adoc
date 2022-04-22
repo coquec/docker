@@ -1,0 +1,1563 @@
+= Docker
+:tags: Publish
+:author: José Couto
+:date: abril 2022
+:revdate: 20220422
+:source-highlighter: rouge
+:toc:
+:toc-title: Índice
+:toclevels: 3
+:numbered:
+:appendix-caption: Apéndice
+:figure-caption: Figura
+:table-caption: Tabla
+:description: Notas sobre Docker. \
+Puede usarse según los términos de la licencia GPLv3.
+
+== Docker
+
+Docker implementa un sistema de contenedores ligeros, procesos aislados
+corriendo en un host.  Cada proceso tiene su propia imagen del sistema de
+archivos, sus interfaces de red y su memoria, y se ejecuta con un usuario
+determinado que puede ser incluso _root_.  Los procesos pueden tener acceso a
+carpetas o a unidades externas de almacenamiento a través de puntos de montaje
+dentro del contenedor, si se les da acceso a ellas al arrancarlos.
+
+Todos los contenedores comparten el kernel del host.  Esto se puede ver
+ejecutando en ellos `uname -a`, que mostrará la misma versión de kernel que en
+el host.
+
+Docker utiliza dos servicios:
+
+* `docker`.  Expone la API REST para comunicarse con el resto de servicios,
+  gestiona el almacenamiento y las redes, la construcción de imágenes, la
+  gestión de la confianza y la gestión de las imágenes.  También implantaba el
+  orquestador swarm.
+
+* `containerd`.
+
+Docker admite plugins para redes y almacenamiento.
+
+_Docker Compose_ es un pequeño orquestador más orientado a un solo host.
+
+Con la CLI podemos gestionar redes, contenedores imágenes e imágenes para los
+datos.  La CLI invoca la API de Docker.
+
+=== Almacenamiento
+
+Docker utiliza dos tipos diferentes de almacenamiento con los contenedores,
+aparte de las capas de las imágenes gestionadas con drivers de almacenamiento:
+los volúmenes y los montajes enlazados (_bind mounts_).
+
+==== Fusión de las capas de las imágenes
+
+Los drivers se utilizan para fusionar las distintas capas que forman una
+imagen, añadirle la capa de lectura/escritura del contenedor y y mostrar al
+contenedor un sistema de archivos con todas las capas unificadas.  Docker
+utiliza por defecto el sistema de archivos _overlay_ de Linux para hacer esto,
+con el driver _overlay2_.
+
+Cuando se lanza un contenedor, Docker utiliza el driver de almacenamiento para
+poner una capa de escritura sobre las capas de la imagen.  La capa de escritura
+guardará todos los cambios que haga el proceso del contenedor sobre el sistema
+de archivos.  Esta capa se eliminará de forma automática cuando se elimine el
+contenedor (si se ejecutó con la opción `--rm` de <<docker_run>> o al borrarlo
+con <<docker_rm>>).
+
+WARNING: Dentro de un contenedor, se puede ver qué capas forman la imagen final
+buscando `overlay` en la salida de `mount`, o bien en `/etc/mtab` o en
+`/proc/mounts`.  En ese punto de montaje, la ubicación de la capa de escritura
+en el host está en la parte marcada con `upperdir=...`.
+
+Para persistir los datos de los contenedores que corran en un host, tenemos dos
+opciones, usar volúmenes gestionados por Docker o exponer contenido del host en
+el contenedor mediante un punto de montaje.  Cualquiera de las dos opciones se
+configura con las opciones `-v` o `--mount` de <<docker_run>>, que *no son
+equivalentes* (`-v` crea la carpeta en el host si no existe ya, mientras que
+`--mount` requiere que el origen exista).
+
+==== Volúmenes
+
+Los volúmenes son una de las formas que tiene Docker para persistir los datos d
+e un contenedor.  Tiene varias ventajas frente a los <<bind mounts>>, como
+permitir que se comparta la información de forma más segura entre contenedores
+y estar soportados en las distintas plataformas donde corre Docker (al menos,
+Windows y Linux), además de poder gestionarse con la CLI propia de Docker.
+Según el driver que usemos, permiten guardar los volúmenes en otros hosts o en
+proveedores de la nube y cifrarlos.
+
+Los volúmenes tienen mejor rendimiento que los drivers de almacenamiento de las
+imágenes, especialmente para las operaciones de escritura.
+
+En local, los volúmenes se implementan como carpetas del host que por defecto
+residen en `/var/lib/docker/volumes`.
+
+Cuando se lanza un contenedor *y se monta en él un volumen vacío*, se copia en
+él el contenido de el directorio del contenedor sobre el que se va a montar, de
+forma que se puede meter en la imagen el contenido por defecto de los volúmenes
+que necesite el contenedor.  Por ejemplo, si partimos de la imagen `blas`
+creada con este <<dockerfile>>:
+
+[source,docker]
+----
+ARG alpine_version=3.15.4
+
+FROM alpine:$alpine_version
+
+ARG alpine_version
+
+RUN mkdir /version && \
+    echo -n $alpine_version >> /version/version
+
+VOLUME /version
+
+CMD ["ls","-al","/version"]
+----
+
+Tenemos lo siguiente:
+
+[source,console]
+----
+$ sudo ls -al /var/lib/docker/volumes
+total 40
+drwx-----x  2 root root   4096 abr 12 16:05 .
+drwx--x--- 15 root root   4096 abr 11 18:28 ..
+brw-------  1 root root 253, 1 abr 11 18:28 backingFsBlockDev
+-rw-------  1 root root  65536 abr 12 16:05 metadata.db
+
+$ docker run --rm --mount source=blas,target=/version blas_container
+total 12
+drwxr-xr-x    2 root     root          4096 Apr 12 14:07 .
+drwxr-xr-x    1 root     root          4096 Apr 12 14:07 ..
+-rw-r--r--    1 root     root             6 Apr 12 13:45 version
+
+$ sudo ls -al /var/lib/docker/volumes/blas/_data
+total 12
+drwxr-xr-x 2 root root 4096 abr 12 16:07 .
+drwx-----x 3 root root 4096 abr 12 16:07 ..
+-rw-r--r-- 1 root root    6 abr 12 15:45 version
+----
+
+En este caso, el volumen se crea al lanzar el contenedor, por lo que está vacío
+y se inicializa con el contenido de la carpeta de la imagen donde se va a
+montar.  La hora de creación del archivo `version` son las 15:45, cuando se
+creó la imagen.
+
+[source,console]
+----
+$ yes | (docker container prune && docker image prune && docker volume prune && docker system prune)
+WARNING! This will remove all stopped containers.
+Are you sure you want to continue? [y/N] Total reclaimed space: 0B
+WARNING! This will remove all dangling images.
+Are you sure you want to continue? [y/N] Total reclaimed space: 0B
+WARNING! This will remove all local volumes not used by at least one container.
+Are you sure you want to continue? [y/N] Deleted Volumes:
+blas
+
+Total reclaimed space: 6B
+WARNING! This will remove:
+  - all stopped containers
+  - all networks not used by at least one container
+  - all dangling images
+  - all dangling build cache
+
+Are you sure you want to continue? [y/N] Total reclaimed space: 0B
+
+$ docker volume ls
+DRIVER    VOLUME NAME
+
+$ docker volume create blas
+blas
+
+$ sudo ls -al /var/lib/docker/volumes/blas/_data
+[sudo] password for jcouto:
+total 8
+drwxr-xr-x 2 root root 4096 abr 12 16:13 .
+drwx-----x 3 root root 4096 abr 12 16:13 ..
+
+$ docker run --rm --mount source=blas,target=/version blas_container
+total 12
+drwxr-xr-x    2 root     root          4096 Apr 12 14:14 .
+drwxr-xr-x    1 root     root          4096 Apr 12 14:14 ..
+-rw-r--r--    1 root     root             6 Apr 12 13:45 version
+
+$ sudo ls -al /var/lib/docker/volumes/blas/_data
+total 12
+drwxr-xr-x 2 root root 4096 abr 12 16:14 .
+drwx-----x 3 root root 4096 abr 12 16:13 ..
+-rw-r--r-- 1 root root    6 abr 12 15:45 version
+----
+
+Aunque hayamos creado el volumen antes de lanzar el contenedor, al estar vacío
+se ha copiado en él el contenido de la imagen.
+
+[source,console]
+----
+$ yes | (docker container prune && docker image prune && docker volume prune && docker system prune)
+...
+...
+
+$ docker volume create blas
+blas
+
+$ sudo touch /var/lib/docker/volumes/blas/_data/archivo
+$ sudo ls -al /var/lib/docker/volumes/blas/_data
+total 8
+drwxr-xr-x 2 root root 4096 abr 12 16:16 .
+drwx-----x 3 root root 4096 abr 12 16:16 ..
+-rw-r--r-- 1 root root    0 abr 12 16:16 archivo
+
+$ docker run --rm --mount source=blas,target=/version blas_container
+total 8
+drwxr-xr-x    2 root     root          4096 Apr 12 14:16 .
+drwxr-xr-x    1 root     root          4096 Apr 12 14:17 ..
+-rw-r--r--    1 root     root             0 Apr 12 14:16 archivo
+----
+
+Como en este caso el volumen no estaba vacío, no se inicializa con el contenido
+de la carpeta de la imagen.
+
+[[bind_mounts,bind mounts]]
+==== Bind mounts
+
+Los bind mounts pueden utilizar cualquier carpeta *o archivo* del host.  Por lo
+demás, son similares a los volúmenes, aunque mucho menos flexibles.
+
+==== Montajes tmpfs
+
+Se puede especificar un tercer tipo de montaje para que los contenedores puedan
+escribir archivos que no haya que compartir con otros contenedores ni
+persistir.  Con la opción `--tmpfs` de <<docker run>> o con `--mount
+type=tmpfs`, se puede montar un sistema de archivos tmpfs en el contenedor.  Se
+recomienda usar `--mount` para hacerlo, ya que permite especificar el tamaño
+del sistema de archivos y los permisos sobre él, lo que no es posible con
+`--tmpfs`, que no pone límite al tamaño.
+
+==== Diferencias entre volúmenes y bind mounts
+
+. Los volúmenes tienen mejor rendimiento que los bind mounts, dependiendo de la
+  plataforma.
+
+. Se puede establecer el tamaño máximo ocupado por los volúmenes, pero no por
+  los bind mounts.
+
+. El contenido de la carpeta de la imagen donde se hace el montaje no se copia
+  al host en los bind mounts, pero sí en los volúmenes, si están vacíos al
+  lanzar el contenedor.
+
+. Los bind mounts permiten configurar la propagación de los montajes a otros
+  puntos de montaje dentro del contenedor.
+
+. Los bind mounts permiten modificar las etiquetas de `selinux` en el host.
+
+=== Red
+
+Los contenedores tienen su propia visión de la red.  Si no se especifica otra
+cosa al arrancarlos, Docker les conecta a una red por defecto llamada _bridge_,
+compartida por todos los contenedores, con dirección IP 172.17.0.0/16.  Además
+de esta, docker crea por defecto las redes _host_ y _none_:
+
+[source,console]
+----
+$ docker network ls
+NETWORK ID     NAME      DRIVER    SCOPE
+cfdfe3742e6f   bridge    bridge    local
+21c4d12795cf   host      host      local
+3dfb67a3cdaf   none      null      local
+----
+
+Podemos especificar la red a la que queremos asociar un contenedor con la
+opción `--network` de <<docker_run>>.
+
+La red _host_ *da al contenedor acceso completo al stack de red del host*,
+incluyendo todas las interfaces configuradas en él, las rutas y los puertos
+abiertos por las aplicaciones del host.  Si se abren puertos en el contenedor,
+quedarán expuestos a través de las interfaces del host.  No es posible
+modificar las reglas de filtrado `iptables` desde el contenedor.
+
+La red _none_ deja el contenedor aislado, configurando en él únicamente la
+interfaz de loopback `localhost`.
+
+Un contenedor puede estar conectado a varias redes a la vez, aunque sean de
+diferente tipo.
+
+Se permiten las comunicaciones entre los contenedores que compartan una red.
+Los contenedores pueden utilizar el nombre de otros contenedores para
+encontrarlos.
+
+Docker permite utilizar drivers de red de terceros mediante plugins.  El driver
+`macvlan` permite definir una MAC virtual para el contenedor y utilizarla
+directamente como un dispositivo físico en las redes a las que se conecte el
+host.
+
+Por cada red de tipo _bridge_ se crea una interfaz virtual en el host, con la
+primera IP del rango de la red para hacer de gateway de los contenedores en
+ella.  Se utiliza _iptables_ en el host para impedir tráfico entre redes
+distintas.
+
+En el host también se crea una interfaz virtual por cada interfaz de los
+contenedores.  Se puede utilizar `tcpdump` en ellas para ver el tráfico de los
+contenedores en el host.
+
+=== Imágenes oficiales de aplicaciones para Docker
+
+En el https://hub.docker.om[hub de Docker] hay imágenes de distintas
+aplicaciones que se consideran oficiales, lo que significa que siguen las
+recomendaciones de Docker sobre las buenas prácticas de los archivos
+`Dockerfile`, están creadas en colaboración con las personas que mantienen los
+respectivos proyectos (o por ellas mismas), y se gestionan en los repositorios
+de GitHub que hay bajo la organización
+https://github.com/docker-library[docker-library].
+
+=== Alternativas para el runtime
+
+* https://gvisor.dev/docs/[gVisor] proporciona mejor aislamiento del kernel del
+  host.
+
+* https://cri-o.io/[CRI-O] es el runtime adoptado por el CNCF, y es un runtime
+  ligero pensado especialmente para utilizarse en Kubernetes.
+
+== Seguridad
+
+=== Permisos para ejecutar docker
+
+Por defecto, `docker` solo puede ejecutarlo el usuario _root_.  Para que
+cualquier usuario pueda usarlo, es necesario que pertenezca al grupo _docker_.
+
+WARNING: Un usuario con permisos para ejecutar `docker` puede hacerse
+administrador de su sistema, por ejemplo creando desde el contenedor un
+ejecutable _setuid root_ en un volumen compartido y ejecutándolo después en el
+host.
+
+=== Credenciales para los registry
+
+Se guardan en `~/.docker/`.
+
+== CLI de docker
+
+=== Órdenes relativas a imágenes
+
+[[docker_build,docker build]]
+==== docker build <contexto>
+
+Construye una imagen a partir de las instrucciones de un archivo `Dockerfile` y
+un _contexto_ con todos los archivos mencionados en las instrucciones.  El
+contexto puede ser una carpeta local, un archivo `.tar` o la URL de un
+repositorio Git.  Docker espera que el archivo con las instrucciones para
+construir la imagen se llame `Dockerfile` y que esté en la raíz del contexto, a
+menos que se especifique que está en otro lugar con la opción `-f`.  La
+construcción la hace el demonio de Docker.  La CLI le entrega el `Dockerfile` y
+todo su contexto que, en el caso de que sea una carpeta local, incluye todas
+las carpetas dentro de ella.
+
+Se puede utilizar la opción `-t nombre_imagen[:tag]` para especificar el nombre
+de la imagen y una etiqueta opcional.
+
+[[docker_history,docker history]]
+==== docker image history <imagen>
+
+Alias: `docker history`.
+
+Muestra las órdenes utilizadas para crear una imagen.  Necesita como parámetro
+el nombre o el identificador de la imagen.
+
+[[docker_images,docker images]]
+==== docker image ls
+
+Alias: `docker images`.
+
+Lista las imágenes que tiene el demonio de Docker.
+
+[[docker_pull,docker pull]]
+==== docker image pull <imagen>
+
+Alias: `docker pull`.
+
+Obtiene una imagen del _registry_ configurado, o del que se anteponga al nombre
+e la imagen separado con una '/'.
+
+Si no decimos nada, se baja la versión _latest_.  Para especificar una versión
+específica, ponerla a continuación del nombre de la imagen, separada con `:`
+
+[[docker_push,docker push]]
+==== docker image push <imagen[:etiqueta]>
+
+Alias: `docker push`.
+
+Transfiere una imagen local al registro de imágenes al que hayamos hecho login
+con <<docker_login>>.
+
+El nombre de la imagen debe incluir la ruta dentro del repositorio.  Por
+ejemplo, si hubiéramos hecho login en el hub de Docker con la cuenta blas, las
+imágenes deberían llamarse blas/<nombre>:tag.
+
+Se pueden transferir a la vez todas las versiones etiquetadas de una imagen con
+la opción `-a`.
+
+[[docker_rmi,docker rmi]]
+==== docker image rm <imagen>
+
+Alias: `docker rmi`.
+
+Elimina una imagen del demonio de Docker.
+
+[[docker_tag,docker tag]]
+==== docker tag <img_orig[:etiqueta]> <img_dest[:etiqueta]>
+
+Establece un nombre y, opcionalmente, una etiqueta para una imagen.  Se trata
+de un alias local, a menos que se suba la imagen a un repositorio con
+<<docker_push>>.
+
+=== Órdenes relativas a contenedores
+
+[[docker_attach,docker attach]]
+==== docker container attach
+
+Alias: `docker attach`.
+
+Conecta los `stdin`, `stdout` y `stderr` del terminal actual al proceso en
+ejecución de un contenedor.
+
+[[docker_commit,docker commit]]
+==== docker container commit
+
+Alias: `docker commit`
+
+Crea una imagen con los cambios hechos por un contenedor en su capa de
+escritura.  La imagen incluirá los cambios hechos en volúmenes montados en el
+contenedor.  El contenedor se pausará mientras se crea la imagen, lo que puede
+evitarse con la opción `--pause=false`.  También se puede usar la opción
+`--change` para aplicar a la imagen una de las instrucciones válidas del
+`Dockerfile`.
+
+Al final de la orden se puede pasar el `nombre_imagen[:tag]` para poner un
+nombre a la imagen y una etiqueta opcional.
+
+[[docker_exec,docker exec]]
+==== docker container exec
+
+Alias: `docker exec`.
+
+Ejecuta un nuevo proceso dentro de un contenedor en ejecución.  Normalmente se
+usa con las opciones `-it` para lanzar una shell interactiva y hacer
+diagnósticos, aunque se puede usar con `-d` para lanzar procesos en background,
+por ejemplo.
+
+Se puede especificar el usuario con el que lanzar el proceso con `-u` (p. ej,
+`-u root`).  *El nombre del usuario debe estar en la imagen del contenedor*.
+
+[[docker_logs,docker logs]]
+==== docker container logs <contenedor>
+
+Alias: `docker logs`.
+
+Muestra los registros de un contenedor (en general, lo que haya producido en su
+salida estándar).  Usar la opción `-f` para mostrar en vivo los logs generados.
+
+[[docker_ps,docker ps]]
+==== docker container ls
+
+Alias: `docker ps`.
+
+Muestra los contenedores en ejecución.  Con la opción '-a' se muestra los que
+están parados y ya no se están ejecutando (pero no se les ha eliminado la capa
+de escritura).
+
+La opción `-s` muestra la columna SIZE, con el espacio utilizado por la capa de
+escritura del contenedor y el espacio total usado por las capas de lectura más
+la de escritura, en lo que se llama espacio `virtual`:
+
+[source,console]
+----
+$ docker ps -s
+CONTAINER ID   IMAGE     COMMAND                  CREATED      STATUS      PORTS                 NAMES     SIZE
+e77b45264972   mysql     "docker-entrypoint.s…"   6 days ago   Up 3 days   3306/tcp, 33060/tcp   wp-db     974B (virtual 521MB)
+----
+
+Como las capas de solo lectura pueden estar compartidas entre varios
+contenedores, el espacio total utilizado por Docker no se corresponde con la
+suma de espacio virtual de los distintos contenedores.  Esto puede verse con la
+orden <<docker_system_df>>.
+
+[[docker_kill,docker kill]]
+==== docker container kill
+
+Alias: `docker kill`.
+
+Mata el proceso principal de un contenedor enviándole la señal SIGKILL.  Se
+puede utilizar para enviarle otras señales con la opción `-s`.  Mantiene la
+capa de escritura del contenedor, *a menos que se hubiera ejecutado con `--rm`,
+en cuyo caso se elimina*.
+
+[[docker_container_prune,docker container prune]]
+==== docker container prune
+
+Borra todos los contenedores parados, eliminando las capas de escritura que se
+han puesto sobre sus imágenes de solo lectura.
+
+[[docker_restart,docker restart]]
+==== docker container restart
+
+Alias: `docker restart`.
+
+Relanza un contenedor , parando su proceso principal y volviéndolo a arrancar.
+*A diferencia de `docker stop`, mantiene la capa de escritura del contenedor,
+aunque se hubiera arrancado con `--rm`*.
+
+[[docker_rm,docker rm]]
+==== docker container rm
+
+Alias: `docker rm`.
+
+Elimina un contenedor parado, borrando su capa de escritura.  Se puede borrar
+un contenedor que esté arrancado con la opción `-f`, que mata el proceso con
+SIGKILL.
+
+[[docker_start,docker start]]
+==== docker container start
+
+Alias: `docker start`.
+
+Arranca un contenedor que estuviera parado, utilizando la capa de escritura que
+tuviera.
+
+[[docker_stop,docker stop]]
+==== docker container stop
+
+Alias: `docker stop`.
+
+Detiene un contenedor, parando su proceso principal con una señal SIGTERM,
+dándole la oportunidad de cerrarse de forma ordenada.  Si el proceso no termina
+en un tiempo determinado (ajustable con la opción `-t`, 10s por defecto), se
+mata con SIGKILL.  Mantiene la capa de escritura del contenedor, *a menos que
+se hubiera ejecutado con `--rm`, en cuyo caso se elimina*.
+
+[[docker_top,docker top]]
+==== docker container top <contenedor>
+
+Alias: `docker top`.
+
+Muestra información sobre el proceso que se está ejecutando en un contenedor.
+Se le puede pasar después del nombre del contenedor cualquier opción que admita
+la orden `ps`.
+
+[[docker_inspect,docker inspect]]
+==== docker inspect <objeto>
+
+Muestra información detallada de un objeto (contenedor, imagen, volumen,
+red...).  Para contenedores incluye, entre otros, el PID con el que se está
+ejecutando en el host, la orden que está ejecutando, el tiempo que lleva
+funcionando, el estado de funcionamiento (pausado, funcionando, parado), la
+información sobre la red (direcciones, redirecciones de puertos...), los puntos
+de montaje del sistema de archivos.
+
+Se puede extraer un dato concreto con la opción `--format`.
+
+Existen órdenes específicas para distintos tipos de objetos, como `docker
+container inspect`, `docker image inspect`, `docker network inspect`, `docker
+volume inspect`...
+
+[[docker_run,docker run]]
+==== docker run <imagen>
+
+Ejecuta un contenedor con la imagen especificada.  Si la imagen no está en el
+demonio de Docker, se busca del _registry_ configurado.  Se puede especificar
+el registro anteponiéndolo al nombre de la imagen, separado con una `/`.
+
+A menos que se especifique lo contrario, el proceso especificado en la imagen
+arranca en primer plano (_attach mode_), con las corrientes estándar del
+proceso `stdin`, `stdout` y `stderr` conectadas a nuestro terminal, y
+enviándole las señales generadas en él.  Se pueden lanzar en segundo plano con
+`-d`.
+
+Podemos ejecutar procesos interactivos en un contenedor que ya se esté
+ejecutando y conectarles una pseudo-TTY, con las opciones `-it`:
+
+[source,console]
+----
+$ docker run -it <imagen> <orden> <args...>
+----
+
+Si el contenedor estuviera pensado para ejecutar una orden en modo interactivo
+(p. ej, `bash`), podemos ejecutarlo en background y usar la opción `-t` para
+asignarle una pseudo-TTY en su `stdin`, de manera que el proceso no termine:
+
+[source,console]
+----
+$ docker run -dt centos
+Unable to find image 'centos:latest' locally
+latest: Pulling from library/centos
+a1d0c7532777: Pull complete
+Digest: sha256:a27fd8080b517143cbbbab9dfb7c8571c40d67d534bbdee55bd6c473f432b177
+Status: Downloaded newer image for centos:latest
+fc638b134b5bc8c43a7db0f0e6e8600330d0107f241cd25ddc4158b3d476aa6e
+
+$ docker ps
+CONTAINER ID   IMAGE     COMMAND       CREATED          STATUS         PORTS     NAMES
+fc638b134b5b   centos    "/bin/bash"   10 seconds ago   Up 3 seconds             musing_haslett
+
+$ docker run -it centos bash
+[root@278aca665615 /]# ps -ef
+UID          PID    PPID  C STIME TTY          TIME CMD
+root           1       0  0 16:17 pts/0    00:00:00 bash
+root          17       1  0 16:17 pts/0    00:00:00 ps -ef
+[root@278aca665615 /]# exit
+
+$ docker ps -a
+CONTAINER ID   IMAGE     COMMAND       CREATED              STATUS                     PORTS     NAMES
+278aca665615   centos    "bash"        17 seconds ago       Exited (0) 9 seconds ago             kind_kowalevski
+fc638b134b5b   centos    "/bin/bash"   About a minute ago   Up About a minute                    musing_haslett
+
+$ docker kill fc638b134b5b
+fc638b134b5b
+
+$ docker ps -a
+CONTAINER ID   IMAGE     COMMAND       CREATED         STATUS                        PORTS     NAMES
+278aca665615   centos    "bash"        2 minutes ago   Exited (0) 2 minutes ago                kind_kowalevski
+fc638b134b5b   centos    "/bin/bash"   3 minutes ago   Exited (137) 24 seconds ago             musing_haslett
+
+$ docker rm 278aca665615 fc638b134b5b
+278aca665615
+fc638b134b5b
+----
+
+También podemos redirigir puertos del servidor hacia el contenedor con la
+opción `-p [host_ip]:[host_port]:[container_port]`.  La IP del host es
+opcional.  Esta orden hace que cambien las tablas `DOCKER` de iptables.
+
+Podemos montar carpetas locales en el contenedor con la opción `-v
+[/host/volume/location]:[/container/storage]`, independientemente de los
+volúmenes que se hayan declarado en la imagen.
+
+También podemos eliminar el contenedor cuando termine el proceso que se ejecuta
+en él, usando la opción `--rm`.  Si no hacemos esto, el contenedor permanecerá
+en el sistema, con la capa de escritura en él.  Podemos ejecutar órdenes
+interactivas en él para ver los cambios.
+
+La opción `--env clave=valor` sirve para asignar variables de entorno que
+pueden examinarse dentro del contenedor.
+
+Se puede usar la opción `--name <nombre>` para ponerle un nombre al contenedor.
+Si no lo hacemos, Docker les pondrá nombres aleatorios.
+
+===== Configuración de la seguridad
+
+Podemos ejecutar el contenedor con distintas opciones para limitar las
+funciones que puede ejecutar con `--security-opt`.  Por ejemplo `--security-opt
+apparmor=unconfined` impide que se use apparmor con él, y `--security-opt
+apparmor=<profile>` lo lanza con un perfil de AppArmor personalizado.  Podemos
+hacer algo similar respecto a seccomp con `--security-opt seccomp=unconfined` y
+`--security-opt seccomp=<profile>`.
+
+[[docker_stats,docker stats]]
+==== docker stats
+
+Muestra las estadísticas de consumo de recursos de todos los contenedores o de
+los que se pasen por parámetro.
+
+=== Órdenes relativas a registros
+
+[[docker_push,docker push]]
+==== docker image push
+
+Transfiere una imagen al repositorio de imágenes en el que hayamos hecho login.  Con la opción `-a`, se suben todas
+
+[[docker_login,docker login]]
+==== docker login [servidor]
+
+Hace login en un registro de imágenes, o en `hub.docker.com` si no se
+especifica ninguno.  Se puede pasar el usuario con la opción `-u`, y la
+contraseña con `-p`.  Para ejecutarlo de forma no interactiva, se puede usar la
+opción `--password-stdin` para pasar la contraseña por la entrada estándar.
+
+WARNING: Al hacer login, las credenciales se guardan codificadas en BASE64 en
+`~/.docker/config.json`.  Esto se puede evitar utilizando el almacén de
+credenciales del sistema operativo con alguno de los
+https://github.com/docker/docker-credential-helpers/releases[[asistentes que
+hay en GitHub] y cambiando la configuración en el archivo
+`~/.docker/config.json`.  En Debian, parece que el paquete
+`golang-docker-credential-helpers` proporciona estos asistentes, pero el
+paquete requiere el keyring de Gnome.
+
+NOTE: Para comprobar si hemos hecho login en un servidor, podemos usar `docker
+info | grep -iE 'username'`.
+
+[[docker_logout,docker logout]]
+==== docker logout
+
+Cierra la sesión con el registro de imágenes.
+
+[[docker_search,docker search]]
+==== docker search <nombre>
+
+Busca una imagen en el _registry_, e indica si se trata de imágenes oficiales y
+si están automatizadas.
+
+=== Órdenes relativas a almacenamiento
+
+[[docker_builder_prune,docker builder prune]]
+==== docker builder prune
+
+Limpia la caché de construcción de imágenes utilizada por <<docker build>>.
+
+[[docker_system_df,docker system df]]
+==== docker system df
+
+Muestra el espacio utilizado por Docker, incluyendo el espacio de las imágenes,
+las capas de escritura de los contenedores, los volúmenes locales y la caché de
+construcción de imágenes.  Se puede ver el detalle con la opción `-v`.
+
+=== Órdenes relativas a redes
+
+[[docker_network_connect,docker network connect]]
+==== docker network connect <red> <contenedor>
+
+Conecta un contenedor a una red que no sea _host_.  Un contenedor conectado a
+la red _none_ no puede estar conectado a ninguna otra.
+
+[[docker_network_create,docker network create]]
+==== docker network create <red>
+
+Crea una nueva red.  Podemos especificar el driver a utilizar con la opción
+`--driver` (por defecto, `bridge`, aunque también puede ser `none`, `host` y
+`overlay`, esta última soporta comunicación entre contenedores que corran en
+distintos hosts, como los orquestados con Docker swarm).
+
+[[docker_network_disconnect,docker network disconnect]]
+==== docker network disconnect <red> <contenedor>
+
+Desconecta un contenedor de una red.
+
+[[docker_network_inspect,docker network inspect]]
+==== docker network inspect <red>
+
+Muestra los detalles de una red, incluyendo las direcciones IP asignadas en
+ella y los contenedores asociados.
+
+[[docker_network_ls,docker network ls]]
+==== docker network ls
+
+Muestra las redes creadas por Docker: identificador, nombre, driver y alcance
+(generalmente, local).
+
+=== Otras órdenes
+
+[[docker_build,docker build]]
+==== docker builder build
+
+Alias: `docker build`
+
+Construye una imagen siguiendo las instrucciones de un <<dockerfile>>.
+
+[[docker_info,docker info]]
+==== docker system info
+
+Alias: `docker info`.
+
+Muestra información sobre el cliente y el servidor de docker, incluyendo los
+drivers y los plugins usados, las opciones de seguridad, el sistema operativo
+base, el directorio raíz de Docker (donde se crean los directorios usados para
+hacer el overlay de las imágenes), la cantidad de contenedores e imágenes que
+hay en el sistema...
+
+[source,console]
+----
+$ docker info
+Client:
+ Context:    default
+ Debug Mode: false
+
+Server:
+ Containers: 2
+  Running: 2
+  Paused: 0
+  Stopped: 0
+ Images: 2
+ Server Version: 20.10.14+dfsg1
+ Storage Driver: overlay2
+  Backing Filesystem: extfs
+  Supports d_type: true
+  Native Overlay Diff: true
+  userxattr: false
+ Logging Driver: json-file
+ Cgroup Driver: systemd
+ Cgroup Version: 2
+ Plugins:
+  Volume: local
+  Network: bridge host ipvlan macvlan null overlay
+  Log: awslogs fluentd gcplogs gelf journald json-file local logentries splunk syslog
+ Swarm: inactive
+ Runtimes: io.containerd.runtime.v1.linux runc io.containerd.runc.v2
+ Default Runtime: runc
+ Init Binary: docker-init
+ containerd version: 1.6.2~ds1-1
+ runc version: 1.1.1+ds1-1
+ init version:
+ Security Options:
+  apparmor
+  seccomp
+   Profile: default
+  cgroupns
+ Kernel Version: 5.16.0-6-amd64
+ Operating System: Debian GNU/Linux bookworm/sid
+ OSType: linux
+ Architecture: x86_64
+ CPUs: 4
+ Total Memory: 15.56GiB
+ Name: XXXXXXX
+ ID: XXXX:XXXX:XXXX:XXXX:XXXX:XXXX:XXXX:XXXX:XXXX:XXXX:XXXX:XXXX
+ Docker Root Dir: /var/lib/docker
+ Debug Mode: false
+ Registry: https://index.docker.io/v1/
+ Labels:
+ Experimental: false
+ Insecure Registries:
+  127.0.0.0/8
+ Live Restore Enabled: false
+----
+
+[[docker_version,docker version]]
+==== docker version
+
+Muestra la versión de la CLI y del servidor:
+
+[source,console]
+----
+$ docker version
+Client:
+ Version:           20.10.14+dfsg1
+ API version:       1.41
+ Go version:        go1.18
+ Git commit:        a224086
+ Built:             Wed Mar 30 16:07:00 2022
+ OS/Arch:           linux/amd64
+ Context:           default
+ Experimental:      true
+
+Server:
+ Engine:
+  Version:          20.10.14+dfsg1
+  API version:      1.41 (minimum version 1.12)
+  Go version:       go1.18
+  Git commit:       87a90dc
+  Built:            Wed Mar 30 16:07:00 2022
+  OS/Arch:          linux/amd64
+  Experimental:     false
+ containerd:
+  Version:          1.6.2~ds1
+  GitCommit:        1.6.2~ds1-1
+ runc:
+  Version:          1.1.1+ds1
+  GitCommit:        1.1.1+ds1-1
+ docker-init:
+  Version:          0.19.0
+  GitCommit:
+----
+
+[[dockerfile]]
+== Dockerfile
+
+El `Dockerfile` es el archivo que indica a Docker cómo construir una imagen de
+solo lectura con `doker build`, y utilizarla para lanzar contenedores.  Lo
+siguiente es un ejemplo del `Dockerfile` usado para la imagen de AsciiDoctor:
+
+[source,docker]
+----
+ARG alpine_version=3.15.4
+FROM alpine:${alpine_version} AS base
+
+ARG asciidoctor_version=2.0.17
+ARG asciidoctor_confluence_version=0.0.2
+ARG asciidoctor_pdf_version=1.6.2
+ARG asciidoctor_diagram_version=2.2.1
+ARG asciidoctor_epub3_version=1.5.1
+ARG asciidoctor_fb2_version=0.5.1
+ARG asciidoctor_mathematical_version=0.3.5
+ARG asciidoctor_revealjs_version=4.1.0
+ARG kramdown_asciidoc_version=2.0.0
+ARG asciidoctor_bibtex_version=0.8.0
+ARG asciidoctor_kroki_version=0.5.0
+
+ENV ASCIIDOCTOR_VERSION=${asciidoctor_version} \
+  ASCIIDOCTOR_CONFLUENCE_VERSION=${asciidoctor_confluence_version} \
+  ASCIIDOCTOR_PDF_VERSION=${asciidoctor_pdf_version} \
+  ASCIIDOCTOR_DIAGRAM_VERSION=${asciidoctor_diagram_version} \
+  ASCIIDOCTOR_EPUB3_VERSION=${asciidoctor_epub3_version} \
+  ASCIIDOCTOR_FB2_VERSION=${asciidoctor_fb2_version} \
+  ASCIIDOCTOR_MATHEMATICAL_VERSION=${asciidoctor_mathematical_version} \
+  ASCIIDOCTOR_REVEALJS_VERSION=${asciidoctor_revealjs_version} \
+  KRAMDOWN_ASCIIDOC_VERSION=${kramdown_asciidoc_version} \
+  ASCIIDOCTOR_BIBTEX_VERSION=${asciidoctor_bibtex_version} \
+  ASCIIDOCTOR_KROKI_VERSION=${asciidoctor_kroki_version}
+
+# # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
+# Minimal image with asciidoctor
+# # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
+
+FROM base AS main-minimal
+RUN echo "assemble minimal main image" # keep here to help --cache-from along
+
+LABEL MAINTAINERS="Guillaume Scheibel <guillaume.scheibel@gmail.com>, Damien DUPORTAL <damien.duportal@gmail.com>"
+
+RUN apk add --no-cache \
+    ruby
+
+RUN gem install --no-document \
+    "asciidoctor:${ASCIIDOCTOR_VERSION}" \
+    "asciidoctor-pdf:${ASCIIDOCTOR_PDF_VERSION}"
+
+
+# # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
+# Haskell build for: erd
+# # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
+
+FROM base AS build-haskell
+RUN echo "building Haskell dependencies" # keep here to help --cache-from along
+
+RUN apk add --no-cache \
+    alpine-sdk \
+    cabal \
+    ghc-dev \
+    ghc \
+    gmp-dev \
+    gnupg \
+    libffi-dev \
+    linux-headers \
+    perl-utils \
+    wget \
+    xz \
+    zlib-dev
+
+RUN cabal v2-update \
+  && cabal v2-install erd
+
+
+# # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
+# Final image
+# # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
+
+FROM main-minimal AS main
+RUN echo "assemble comprehensive main image" # keep here to help --cache-from along
+
+LABEL MAINTAINERS="Guillaume Scheibel <guillaume.scheibel@gmail.com>, Damien DUPORTAL <damien.duportal@gmail.com>"
+
+# Installing packagse required for the runtime of
+# any of the asciidoctor-* functionalities
+RUN apk add --no-cache \
+    bash \
+    curl \
+    ca-certificates \
+    findutils \
+    font-bakoma-ttf \
+    git \
+    graphviz \
+    inotify-tools \
+    make \
+    openjdk17-jre \
+    python3 \
+    py3-pillow \
+    py3-setuptools \
+    ruby-bigdecimal \
+    ruby-mathematical \
+    ruby-rake \
+    ttf-liberation \
+    ttf-dejavu \
+    tzdata \
+    unzip \
+    which \
+    font-noto-cjk
+
+# Installing Ruby Gems for additional functionality
+RUN apk add --no-cache --virtual .rubymakedepends \
+    build-base \
+    libxml2-dev \
+    ruby-dev \
+  && gem install --no-document \
+    "asciidoctor-confluence:${ASCIIDOCTOR_CONFLUENCE_VERSION}" \
+    "asciidoctor-diagram:${ASCIIDOCTOR_DIAGRAM_VERSION}" \
+    "asciidoctor-epub3:${ASCIIDOCTOR_EPUB3_VERSION}" \
+    "asciidoctor-fb2:${ASCIIDOCTOR_FB2_VERSION}" \
+    "asciidoctor-mathematical:${ASCIIDOCTOR_MATHEMATICAL_VERSION}" \
+    asciimath \
+    "asciidoctor-revealjs:${ASCIIDOCTOR_REVEALJS_VERSION}" \
+    coderay \
+    epubcheck-ruby:4.2.4.0 \
+    haml \
+    "kramdown-asciidoc:${KRAMDOWN_ASCIIDOC_VERSION}" \
+    pygments.rb \
+    rouge \
+    slim \
+    thread_safe \
+    tilt \
+    text-hyphen \
+    "asciidoctor-bibtex:${ASCIIDOCTOR_BIBTEX_VERSION}" \
+    "asciidoctor-kroki:${ASCIIDOCTOR_KROKI_VERSION}" \
+  && apk del -r --no-cache .rubymakedepends
+
+# Installing Python dependencies for additional functionality
+# such as diagrams (blockdiag) or syntax highligthing
+RUN apk add --no-cache --virtual .pythonmakedepends \
+    build-base \
+    python3-dev \
+    py3-pip \
+  && pip3 install --no-cache-dir \
+    actdiag \
+    'blockdiag[pdf]' \
+    nwdiag \
+    seqdiag \
+  && apk del -r --no-cache .pythonmakedepends
+
+COPY --from=build-haskell root/.cabal/bin/erd     /bin/
+
+WORKDIR /documents
+VOLUME /documents
+
+CMD ["/bin/bash"]
+----
+
+[[buildkit,BuildKit]]
+=== BuildKit
+
+A partir de la versión 18.09 de Docker, las imágenes pueden construirse con
+`docker build` usando una herramienta más eficiente llamada BuildKit.  Para
+ello, hay que definir la variable de entorno `DOCKER_BUILDKIT=1`.
+
+BuildKit soporta distintas versiones del archivo `Dockerfile`.  Se puede
+especificar en él con qué versión debe interpretarse poniéndolo en la primera
+línea, por ejemplo `# syntax=docker/dockerfile:1.4`.
+
+[[add,ADD]]
+=== ADD <origen>... <destino>
+
+Copia archivos a una nueva capa de la imagen.  El origen puede ser un archivo
+local *dentro del contexto de construcción*, una URL o un archivo `.tar`,
+comprimido o no.  En este último caso, el contenido se extraerá en la carpeta
+de destino.
+
+Si el destino es una carpeta, *debe terminar con una barra `/`*.
+
+Podemos utilizar comodines para los archivos de origen.  Si tuvieran espacios
+en el nombre, hay que usar esta sintaxis: `ADD
+["origen1","origen2"... "destino"]`.
+
+Los paths relativos de origen toman como referencia el directorio donde se
+encuentre el `Dockerfile`, y el de destino el especificado con <<workdir>>.
+
+Por defecto, los archivos se crean en la imagen con UID y GID 0, pero se puede
+utilizar la opción `--chown=<usuario>:<grupo>` para ajustar esto.  El usuario y
+el grupo tienen que existir en la imagen.
+
+[[arg,ARG]]
+=== ARG <clave>[=<valor_defecto>]
+
+Define una variable que puede utilizarse para hacer sustituciones en las
+órdenes que vengan a continuación en el `Dockerfile`, y que debe definirse al
+construir la imagen con la opción `--build-arg clave=valor` de
+<<docker_build>>.  Estas variables también se pasan como entorno para las
+órdenes <<run>>, *pero no forman parte del entorno de ejecución del contenedor*
+(no se guardan en la imagen).  Para las órdenes <<run>>, las variables
+definidas con <<env>> tienen prioridad sobre las definidas con `ARG` si se
+llaman igual.
+
+Se puede dar un valor por defecto a las variables, que se usarán si no se
+define por línea de comandos.  Es necesario utilizar comillas o caracteres de
+escape con valores que tengan espacios en blanco.
+
+WARNING: Esta orden no debe usarse para configurar secretos en la imagen,
+porque cualquiera puede verlos con `docker history`.
+
+Docker define algunos argumentos estándar para proxies (p. ej, `HTTPS_PROXY`),
+que por defecto no se guardan en la historia de la imagen, y otras con
+información sobre la construcción de la imagen, si se construye con
+<<buildkit>>, como `TARGETARCH`.
+
+WARNING: Los argumentos solo pueden utilizarse en el `Dockerfile` después de
+definirlos con `ARG` aunque se les dé un valor con `docker build --build-arg`.
+
+Las variables definidas con `ARG` tienen un alcance de una imagen (dentro de un
+FROM).  Las variables definidas con `ARG` antes de cualquier <<from>> solo
+pueden usarse en los <<from>>, no dentro de ellos.  Para poderlos usar dentro,
+hay que volver a definirlas dentro de ellos:
+
+[source,docker]
+----
+ARG alpine_version=3.15.4
+
+#------------------------------------------------------------------------------
+# Imagen base. Podemos usar la variable en el FROM, al estar definida en el
+# alcance global.
+
+FROM alpine:$alpine_version AS base
+
+# Este archivo estará vacío, porque la variable solo está definida en
+# el alcance global.
+
+RUN echo -n $alpine_version >> /version
+
+#------------------------------------------------------------------------------
+# Nueva imagen. Como antes, podemos usar la variable en el FROM.
+
+FROM alpine:$alpine_version
+
+# Introducimos la variable en el alcance de esta imagen con ARG.
+
+ARG alpine_version
+
+# Sin la orden ARG anterior, la variable no estaría definida.
+RUN echo -n $alpine_version >> /version
+
+COPY --from=base /version /version-base
+
+CMD ["/bin/sh", "-c", "ls -al /version*"]
+----
+
+Los archivos creados en la imagen con ese `Dockerfile` estarán así:
+
+[source]
+----
+$ docker build -t imagen .
+...
+...
+
+$ docker run --rm imagen
+-rw-r--r--    1 root     root             6 Apr  7 10:29 /version
+-rw-r--r--    1 root     root             0 Apr  7 10:29 /version-base
+----
+
+[[cmd,CMD]]
+=== CMD
+
+Especifica la orden por defecto que se ejecutará *al lanzar el contenedor con
+`docker run`*.  Esta orden solo modifica los metadatos de la imagen, sin
+generar una nueva capa.
+
+Si hubiera más de una orden CMD en el `Dockerfile`, solo tendrá efecto la
+última.
+
+Se puede especificar la orden a ejecutar en formato de shell (`CMD ejecutable
+param...`), que se ejecutará mediante el intérprete especificado con <<shell>>,
+o en formato _exec_ (`CMD ["ejecutable","param"...]`), que se ejecutará
+directamente.
+
+En realidad, el formato de shell se traduce en un array con lo que se
+especifique en la orden <<shell>>.  Por ejemplo, si no se hubiera cambiado la
+shell por defecto, el siguiente código:
+
+[source,docker]
+----
+CMD echo 1 2 3 4
+----
+
+Sería equivalente a:
+
+[source,docker]
+----
+CMD ["/bin/sh", "-c", "echo", "1", "2", "3", "4"]
+----
+
+La orden real que se ejecuta es la compuesta por el resultado de concatenar los
+arrays definidos con <<entrypoint>> y <<cmd>>.
+
+[[copy,COPY]]
+=== COPY <origen>... <destino>
+
+Copia archivos a una capa nueva de la imagen.  El origen puede estar en local o
+en otra imagen intermedia `xxx` que se haya definido previamente en el
+`Dockerfile` con `FROM ... AS xxx`.
+
+Podemos utilizar comodines para los archivos de origen.  Si tuvieran espacios
+en el nombre, hay que usar esta sintaxis: `COPY
+["origen1","origen2"... "destino"]`.
+
+Los paths relativos de origen toman como referencia el directorio donde se
+encuentre el `Dockerfile`, y el de destino el especificado con <<workdir>>.
+
+Por defecto, los archivos se crean en la imagen con UID y GID 0, pero se puede
+utilizar la opción `--chown=<usuario>:<grupo>` para ajustar esto.  El usuario y
+el grupo tienen que existir en la imagen.
+
+Se puede utilizar la opción `--from=<imagen>` para copiar archivos desde otras
+imágenes del repositorio de imágenes o de otras previas creadas con
+`FROM ... AS <imagen>` en el `Dockerfile`.
+
+[[entrypoint,ENTRYPOINT]]
+=== ENTRYPOINT <orden>
+
+Establece el valor de uno los arrays que se utilizan en la llamada del sistema
+_exec_ al lanzar el contenedor con `docker run <imagen>`.  El proceso que se
+lanza es el resultado de concatenar los arrays definidos con `ENTRYPOINT` y
+`CMD`.
+
+La orden se puede especificar en formato de shell (`ENTRYPOINT ejecutable
+param...`, o en formato _exec_ (`ENTRYPOINT ["ejecutable","param"...]`).  En el
+primer caso, el ejecutable se convierte a formato de array para pasárselo como
+argumento a `/bin/sh -c`, o a lo que se haya definido previamente con
+<<shell>>.
+
+WARNING: Si `ENTRYPOINT` se define en formato de shell, *`CMD` se ignorará*.
+En general, *se recomienda usar únicamente el formato _exec_ para las dos
+órdenes*.
+
+Esta instrucción es útil para especificar órdenes que modifiquen de alguna
+manera el entorno o las funciones de la especificada con <<cmd>> (p. ej,
+`time`, `nice`, `chamber`...).
+
+[[env,ENV]]
+=== ENV <clave>=<valor>...
+
+Define el valor de una variable de entorno que puede utilizarse para hacer
+sustituciones en las órdenes que vengan a continuación en el `Dockerfile`,
+usando `${clave}`, o para que la interprete el proceso del contenedor.
+
+Es necesario utilizar comillas o caracteres de escape con valores que tengan
+espacios en blanco.
+
+[[expose,EXPOSE]]
+=== EXPOSE <puerto>[/protocolo]...
+
+Especifica que el contenedor escuchará en un puerto.  El protocolo puede ser
+TCP (por defecto),o UDP.
+
+Para que pueda haber comunicación desde el host hacia el puerto, es necesario
+exponerlo con otro puerto del host mediante `docker run -p
+[host_ip]:[host_port]:[container_port]`.
+
+[[from,FROM]]
+=== FROM <imagen>[:<tag>]
+
+Especifica la imagen de partida que vamos a utilizar para construir la nuestra.
+Podemos construir varias imágenes desde el mismo `Dockerfile`, por ejemplo para
+generar contenido en ellas que luego podemos copiar en nuestra imagen final.
+
+Se puede utilizar la imagen vacía `scratch` para crear una imagen desde cero.
+
+[[label,LABEL]]
+=== LABEL <clave>=<valor>...
+
+Añade metadatos a una imagen, sin modificarla (la orden no genera una nueva
+capa).  Si el valor incluye espacios, hay que ponerlo entre comillas o
+precederlos con `\`.
+
+Las etiquetas se heredan de la imagen base, pero pueden sobrescribirse.
+
+Se puede usar `docker inspect` para ver las etiquetas de una imagen.
+
+La etiqueta `org.opencontainers.image.authors` se puede usar para indicar
+quiénes mantienen la imagen.  Antes se utilizaba la orden `MAINTAINER` para
+especificar esto, pero ya no se recomienda su uso.  Hay un listado de
+https://github.com/opencontainers/image-spec/blob/main/annotations.md[etiquetas
+estándar] en la especificación OCI.
+
+[[run,RUN]]
+=== RUN <orden>
+
+Ejecuta una orden *en una capa nueva* de la imagen.  Si se le pasa una orden,
+se ejecuta con la shell `/bin/sh -c`, que tiene que estar disponible en la
+imagen.  Se puede cambiar por otra shell con la orden `SHELL`.
+
+Con la sintaxis `RUN ["orden", "param1"...]`, la orden se ejecuta directamente,
+sin shell.
+
+WARNING: La imagen resultante se cachea, y se reutilizará si se vuelve a
+construir la imagen final en el futuro.  Por ejemplo, si se hace `RUN apt
+upgrade`, se reutilizará la imagen de la última ejecución.  Para evitar este
+problema, se puede construir la imagen con `docker build --no-cache`.
+
+Si la orden fallara, el proceso de construcción se detendría con un error.
+
+[[shell,SHELL]]
+=== SHELL ["ejecutable", "param"...]
+
+Especifica qué shell de dentro de la imagen se debe usar con las órdenes
+<<run>>, <<cmd>> y <<entrypoint>> que vengan después en el `Dockerfile`.  Esta
+orden se puede poner varias veces en el archivo, y solo tendrá efecto sobre las
+órdenes que vengan después.
+
+[[user,USER]]
+=== USER <UID[:GID]>
+
+Especifica el usuario, y opcionalmente el grupo, con el que se ejecutarán las
+órdenes especificadas por las siguientes instrucciones <<entrypoint>>, <<run>>
+y <<cmd>> del `Dockerfile`.
+
+Se pueden utilizar nombres en vez de números para los dos parámetros, pero en
+ese caso deben estar definidos en los archivos `/etc/passwd` y `/etc/group`
+dentro de la imagen.
+
+WARNING: Si se especifica un grupo, solo se utilizará ese grupo y se ignorará
+el resto de grupos a los que pueda pertenecer el usuario en la imagen.
+
+WARNING: Si el usuario no tuviera un grupo asignado en la imagen, se le
+asignará el usuario `root` (GID 0).
+
+[[volume,VOLUME]]
+=== VOLUME <directorio>...
+
+Declara uno o varios directorios de la imagen donde se espera que se monten
+volúmenes al arrancar el contenedor.  Sirve principalmente para documentar los
+volúmenes que esperamos que se monten en el contenedor, pero además *crea los
+directorios en la imagen si no existieran, y crea el volumen en el host al
+lanzar el contenedor si no se proporciona uno explícitamente*.
+
+Se puede especificar directamente con los directorios o con un array:
+
+[source,docker]
+----
+VOLUME /mnt/db /mnt/users
+VOLUME ["/mnt/db", "/mnt/users"]
+----
+
+[[workdir,WORKDIR]]
+=== WORKDIR <ruta>
+
+Establece el directorio dentro de la imagen que utilizarán las órdenes que usen
+rutas relativas en la imagen que vengan después (<<run>>, <<cmd>>,
+<<entrypoint>>, <<copy>> y <<add>>).  *Si el directorio no existe, se crea*.
+Se puede utilizar varias veces, y se pueden poner rutas absolutas o relativas
+al último `WORKDIR` usado.
+
+[[sustitucion_variables,sustitución de variables]]
+=== Sustitución de variables
+
+Podemos obtener el valor de las variables definidas en el `Dockerfile` con
+<<arg>> o <<env>> con una sintaxis similar a la de `sh`:
+
+* `$variable`.
+
+* `${variable}`.
+
+* `${variable:-valor}`, que devuelve `valor` si la variable no está definida.
+
+* `${variable:+valor}`, que devuelve `valor` si la variable está definida.
+
+=== .dockerignore
+
+Se puede poner un archivo llamado `.dockerignore` en el mismo directorio que el
+`Dockerfile`, con patrones de nombres similares a los usados por cualquier
+shell para especificar archivos que no deben incluirse en el contexto usado
+para construir la imagen final.
+
+[[docker_compose,docker-compose]]
+== docker-compose
+
+Herramienta para ejecutar varios contenedores a la vez, especialmente útil
+durante el desarrollo, para pruebas o en la integración continua.  Utiliza el
+archivo YAML `docker-compose.yml` para definir los servicios que componen
+nuestra aplicación y cómo deben lanzarse, y la orden `docker-compose` como CLI.
+
+[[docker_compose_down,docker-compose down]]
+=== docker-compose down
+
+Detiene los contenedores y elimina los recursos (los propios contenedores, sus
+redes...).  Los volúmenes se mantienen.
+
+[[docker_compose_start,docker-compose start]]
+=== docker-compose start
+
+Relanza contenedores que se hayan parado con <<docker_compose_stop>>.
+
+[[docker_compose_stop,docker-compose stop]]
+=== docker-compose stop
+
+Detiene los contenedores, pero mantiene los recursos.  Pueden volver a lanzarse
+con <<docker_compose_start>>.
+
+[[docker_compose_up,docker-compose up]]
+=== docker-compose up
+
+Se utiliza para levantar los contenedores especificados en el archivo compose.
+Con la opción `-d`, los lanza en background.
+
+== docker-compose.yml
+
+Es el archivo YAML de configuración para `<<docker_compose>>`.  La
+especificación completa está
+https://docs.docker.com/compose/compose-file/[aquí], y lo siguiente es un
+ejemplo básico donde puede verse la estructura general del archivo:
+
+[source,yaml]
+----
+services:
+  frontend:
+    image: awesome/webapp
+    ports:
+      - "443:8043"
+    networks:
+      - front-tier
+      - back-tier
+    configs:
+      - httpd-config
+    secrets:
+      - server-certificate
+
+  backend:
+    image: awesome/database
+    volumes:
+      - db-data:/etc/data
+    networks:
+      - back-tier
+
+volumes:
+  db-data:
+    driver: flocker
+    driver_opts:
+      size: "10GiB"
+
+configs:
+  httpd-config:
+    external: true
+
+secrets:
+  server-certificate:
+    external: true
+
+networks:
+  # The presence of these objects is sufficient to define them
+  front-tier: {}
+  back-tier: {}
+----
+
+En los siguientes apartados se describen los bloques del primer nivel
+
+=== version
+
+Antes de junio de 2020, las versiones de `<<docker_compose>>` necesitaban una
+primera línea tipo `version: "3.6"`.  *Esto está obsolet*o.  Las
+implementaciones de `docker-compose` deben evaluar el archivo compose completo,
+avisar al usuario si encuentran campos que no sepan interpretar, y ofrecer
+alternativas sobre cómo actuar o ignorarlos, dependiendo del modo de ejecución
+de `docker-compose`:
+
+* *default*: avisa al usuario de los atributos no soportados y los ignora.
+
+* *strict*: avisa al usuario de los atributos no soportados y rechaza el
+   archivo `docker-compose.yml`.
+
+* *loose*: ignora los atributos no soportados y los desconocidos (los que no
+   estén definidos por la especificación que utiliza la implantación de
+   `docker-compose`).
+
+NOTE: No encuentro cómo configurar el modo de ejecución de `docker-compose`.
+
+=== services
+
+Indica los contenedores que conforman la aplicación.  Para cada uno de ellos,
+se indica lo que ya hemos visto para los contenedores: el nombre
+(`container_name`), la imagen (`image`), las redes (`networks`), los volúmenes
+(`volumes`), los puertos (`ports`)...
+
+Si queremos proporcionar nuestras propias imágenes en vez de utilizar las que
+haya en un repositorio, podemos hacerlo con `build: <ruta_dockerfile>`.
+`docker_compose up` construirá la imagen si no existe.
+
+== Comprobar si estamos dentro de un contenedor
+
+No hay una forma fiable para comprobar si se está dentro de un contenedor, pero
+hay algunas pistas que podemos tener en cuenta.
+
+. El número de inodo de la raíz es alto (en el host suele ser muy bajo, pero
+  depende del sistema de archivos): `stat -c %i /`.
+
+. La carpeta raíz está montada sobre un sistema de archivos de tipo `overlay`:
+  `mount | grep "/ "`.
+
+. El número de procesos en el sistema es muy bajo: `ls -d /proc/[0-9]* | wc -l`.
+
+. El PID 1 es de un proceso distinto de `init` o `systemd`: `cat /proc/1/cmdline`.
+
+. El proceso 1 está corriendo en un entorno limitado, distinto de unconfined:
+  `cat /proc/1/attr/current`.  Esto no es cierto para los contenedores Docker
+  que se ejecutan con la `docker run --privileged`.
+
+. Existe el archivo `/.dockerenv`.
+
+
+== Información sobre el host desde el contenedor
+
+=== dmesg
+
+Parece que la salida de `dmesg` es idéntica en el contenedor y en el host.
+
+== Bastionado de contenedores
+
+Estas recomendaciones vienen de este
+https://blog.trailofbits.com/2019/07/19/understanding-docker-container-escapes/[artículo]:
+
+. No usar `--privileged` al lanzar el contenedor.
+
+. No montar el socket de Docker `/var/run/docker.sock` en ningún contenedor, ya
+  que permite usar el API de Docker desde él igual que desde el host.
+
+. No ejecutar los contenedores con el usuario root.  El usuario es el mismo que
+  el del host, aunque normalmente tiene permisos más limitados, principalmente
+  usando _namespaces_, _capabilities_ y _cgroups_.
+
+. Eliminar todas las _capabilities_ con `--cap-drop=all` y añadir solo las
+  necesarias con `--cap-add=...`.
+
+. Utilizar la opción `no-new-privileges` para impedir que los procesos ganen
+  privilegios nuevos, por ejemplo lanzando programas suid.
+
+. Limitar los recursos disponibles desde el contenedor para evitar ataques por
+  consumo de recursos contra el host.
+
+. Utilizar perfiles de seccomp, AppArmos o SELinux para limitar las llamadas
+  que puede hacer el proceso del contenedor.
+
+. Utilizar imágenes oficiales de Docker o construir las nuestras usando esas
+  como base.
+
+. Reconstruir las imágenes regularmente y aplicarles los parches de seguridad
+  que se publiquen.
+
+== Para profundizar más
+
+* https://iximiuz.com/en/posts/container-learning-path/[Learning containers
+  from the bottom up].
+
+* https://www.redhat.com/en/blog/architecting-containers-part-1-why-understanding-user-space-vs-kernel-space-matters[Why
+  Understanding User Space vs. Kernel Space Matters].
+
+* https://phoenixnap.com/kb/docker-vs-containerd-vs-cri-o[Docker vs
+  containerd vs CRI-O: An In-Depth Comparison].
+
+* https://aws.amazon.com/blogs/opensource/demystifying-entrypoint-cmd-docker/[Demystifying
+ ENTRYPOINT and CMD in Docker].
+
+* https://docs.docker.com/develop/develop-images/dockerfile_best-practices/[Best
+  practices for writing Dockerfiles].
+
+== Glosario
+
+Container:: Aplicación ejecutándose en un entorno determinado creado por el
+_Container runtime_.  Utiliza una imagen de solo lectura a la que se añade una
+capa de lectura/escritura para que el proceso pueda escribir en ella.  *La capa
+de escritura se elimina cuando el contenedor se borra.*
+
+Container runtime:: Programa que crea el entorno en el que tiene que funcionar
+un contenedor (namespaces, cgroups...).  El más común es `runc`, pero hay un
+https://github.com/opencontainers/runtime-spec[estándar] que define cómo deben
+implantarse.
+
+Contexto:: Conjunto de archivos que se envían al demonio de Docker para
+construir una imagen con `docker build`.
+
+Docker Desktop:: Software para Windows y macOS que permite ejecutar
+contenedores Linux en ellos.
+
+Dockerfile:: Archivo de texto llamado `Dockerfile`, con las instrucciones
+necesarias para construir una imagen para los contenedores.  No siempre están
+disponibles para las imágenes disponibles en un _registry_.
+
+Image:: Suma de capas de solo lectura que componen el sistema de archivos para
+un contenedor.  Los contenedores utilizan sobre ella una capa de lectura y
+escritura, que es la que ven los procesos que se ejecutan en el contenedor.  Se
+pueden construir con la CLI de Docker, usando un `Dockerfile`.  En tiempo de
+ejecución, estas capas se guardan en varias carpetas dentro de
+`/var/lib/docker/overlay2`, y ahí pueden verse los archivos de las distintas
+capas.
+
+Registry:: Repositorio de imágenes de contenedores, p. ej. _Docker Hub_.  Otras
+herramientas tienen repositorios compatibles, como GitHub, GitLab, Nexus o
+JFrog Factory.  _Docker Hub_ es capaz de construir las imágenes cuando se hace
+push en el repositorio correspondiente de GitHub, a través de un webhook.
