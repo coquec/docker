@@ -416,7 +416,11 @@ de un alias local, a menos que se suba la imagen a un repositorio con
 Alias: `docker attach`.
 
 Conecta los `stdin`, `stdout` y `stderr` del terminal actual al proceso en
-ejecución de un contenedor.
+ejecución de un contenedor.  Se puede interrumpir la conexión pulsando
+`Ctrl-P`+`Ctrl-Q`, aunque esto es configurable con la opción `--detach-keys`.
+Si se pulsa `Ctrl-C`, se le envía una señal `SIGKILL` al proceso, que
+normalmente se cerrará, a menos que la ignore (como pasa con los procesos con
+PID 1).
 
 [[docker_commit,docker commit]]
 ==== docker container commit
